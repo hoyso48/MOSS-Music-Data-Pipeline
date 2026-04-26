@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# IDE
+.sii/
+*.swp
+*.swo
+
+# Core dumps
+core.*
+
+# 数据目录
+data/
+outputs/
+ckpt/
+work_dir/
+
+
+# 临时文件
+ray-address.txt
