@@ -261,6 +261,15 @@ def make_seed(stable_key: str) -> str:
     return h[:8]
 
 
+def reject_reasoning_output(text: str) -> str:
+    text = (text or "").strip()
+    lowered = text.lower()
+    leak_markers = ("<think>", "</think>", "here's a thinking process:")
+    if any(marker in lowered for marker in leak_markers):
+        raise RuntimeError("LLM returned hidden reasoning despite enable_thinking=false")
+    return text
+
+
 def build_prompt_for_generator(caption: str, length_class: str, seed: str,
                                style_class: str, language: str) -> str:
     cap = (caption or "").strip() or "(no available description)"
@@ -349,19 +358,20 @@ async def call_llm(session: aiohttp.ClientSession, api_url: str,
         "model": model_name,
         "messages": [
             {"role": "system",
-             "content": "You generate natural user queries for music audio captioning. "
+              "content": "You generate natural user queries for music audio captioning. "
                         "Follow the requested style and output format exactly."},
             {"role": "user", "content": user_prompt},
         ],
         "temperature": temperature,
         "max_tokens": 4096,
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     async with session.post(api_url, headers=headers, json=payload) as resp:
         text = await resp.text()
         if resp.status >= 400:
             raise RuntimeError(f"HTTP {resp.status}: {text[:500]}")
         data = json.loads(text)
-        return data["choices"][0]["message"]["content"].strip()
+        return reject_reasoning_output(data["choices"][0]["message"]["content"])
 
 
 def parse_prompt_json(s: str) -> str:

@@ -287,13 +287,9 @@ def main():
                             consume_one(fut, raw_line)
                             futures.remove((fut, raw_line))
 
-            for fut, raw_line in as_completed([x[0] for x in futures]):
-                raw = None
-                for f2, l2 in futures:
-                    if f2 == fut:
-                        raw = l2
-                        break
-                consume_one(fut, raw or "")
+            raw_by_future = {fut: raw_line for fut, raw_line in futures}
+            for fut in as_completed(raw_by_future):
+                consume_one(fut, raw_by_future[fut])
 
     if pbar:
         pbar.close()

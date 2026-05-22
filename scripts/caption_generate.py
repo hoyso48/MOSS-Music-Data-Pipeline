@@ -469,6 +469,15 @@ def count_lines_fast(path: str) -> int:
     return n
 
 
+def reject_reasoning_output(text: str) -> str:
+    text = (text or "").strip()
+    lowered = text.lower()
+    leak_markers = ("<think>", "</think>", "here's a thinking process:")
+    if any(marker in lowered for marker in leak_markers):
+        raise RuntimeError("LLM returned hidden reasoning despite enable_thinking=false")
+    return text
+
+
 # ─── API call ─────────────────────────────────────────────────────────────────
 
 async def call_llm_async(
@@ -483,12 +492,13 @@ async def call_llm_async(
         "model": model_name,
         "messages": [
             {"role": "system",
-             "content": "You are a helpful assistant with rich music theory knowledge. "
+              "content": "You are a helpful assistant with rich music theory knowledge. "
                         "You write high-quality music captions based on structured analysis."},
             {"role": "user", "content": prompt},
         ],
         "temperature": float(temperature),
         "max_tokens": int(max_tokens),
+        "chat_template_kwargs": {"enable_thinking": False},
     }
     async with session.post(api_url, headers=headers, json=payload) as resp:
         text = await resp.text()
@@ -496,7 +506,7 @@ async def call_llm_async(
             raise RuntimeError(f"HTTP {resp.status}: {text[:500]}")
         data = json.loads(text)
         try:
-            return data["choices"][0]["message"]["content"].strip()
+            return reject_reasoning_output(data["choices"][0]["message"]["content"])
         except Exception as e:
             raise RuntimeError(f"Unexpected response: {text[:500]}") from e
 
