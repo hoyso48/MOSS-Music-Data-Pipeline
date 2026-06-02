@@ -235,12 +235,18 @@ def create_worker(model_type: str = None, model_name: str = None, model_path: st
         'essentia_instrument': {
             'cls': EssentiaInstrumentModel,
             'default_name': 'EssentiaInstrument',
-            'options': {'num_gpus': 0, 'num_cpus': kwargs.pop('num_cpus', 2.0)},
+            'options': {
+                'num_gpus': kwargs.pop('num_gpus', 0),
+                'num_cpus': kwargs.pop('num_cpus', 2.0),
+            },
         },
         'instrument': {
             'cls': EssentiaInstrumentModel,
             'default_name': 'EssentiaInstrument',
-            'options': {'num_gpus': 0, 'num_cpus': kwargs.pop('num_cpus', 2.0)},
+            'options': {
+                'num_gpus': kwargs.pop('num_gpus', 0),
+                'num_cpus': kwargs.pop('num_cpus', 2.0),
+            },
         },
         'beatnet': {
             'cls': BeatNetModel,

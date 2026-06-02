@@ -12,6 +12,7 @@ import json
 import argparse
 import asyncio
 import random
+import re
 import aiohttp
 from aiohttp import ClientTimeout
 from tqdm import tqdm
@@ -38,10 +39,7 @@ HARMONY_RULE_BASIC = """"""
 PROMPT_TEMPLATE = """You are a music description model.
 You receive structured information for a single music track:
 
-audio_path:
-{AUDIO_PATH}
-
-duration (seconds):
+{AUDIO_PATH_SECTION}duration (seconds):
 {DURATION_SEC}
 
 Preliminary description:
@@ -61,10 +59,10 @@ Requirements:
 4. If the preliminary description contradicts other provided data (e.g., instrumentation, genre, mood), trust the preliminary description — it is the most reliable source. When no lyric text appears in any segment, it does NOT necessarily mean the track is instrumental — trust the preliminary description for vocal/instrumental judgment. Never discuss or reveal contradictions between sources.
 5. If lyrics text is present, describe themes and you may cite short representative phrases (no invented lyrics). If a "Reference lyrics" section is provided, treat it as the authoritative lyrical source.
 6. Mention only attributes explicitly supported by the provided information.
-7. If the audio_path clearly reveals identifiable information such as song title, artist name, or album name, incorporate those details naturally. If such info cannot be clearly determined from audio_path, do NOT mention audio_path or speculate.
+7. If audio_path is provided and clearly reveals identifiable information such as song title, artist name, or album name, incorporate those details naturally. If such info cannot be clearly determined from audio_path, do NOT mention audio_path or speculate.
 8. Clearly describe the overall song structure and approximate timestamps (e.g., intro, verses, chorus sections, bridge, instrumental passages, outro), including how arrangement and dynamics develop across sections.
 9. Describe harmonic movement in a musically informed way: explain the main key or tonal center, indicate whether modulation occurs (or state that no clear modulation is evident), and summarize chord progressions conceptually (e.g., "a I–IV–V–vi progression" or "shifts from A minor to C major"). Do NOT list every chord change verbatim; instead describe the harmonic character, functional movement, and tonal color.
-10. Do NOT mention field names, JSON, tags, labels, data sources, analysis tools, or data pipelines in the output. The following words/phrases are FORBIDDEN in your output: "ASR", "自动语音识别", "语音识别", "transcription", "speech recognition", "No Lyrics", "metadata", "元数据", "Base Caption", "Base Music Caption", "preliminary description", "标签", "tagged with", "依据标签", "the metadata indicates", "despite the description", "contradicts". Never explain how the data was obtained or processed. Never compare, contrast, or discuss differences between data sources. Write as if you are a human listener describing what you hear — present a single coherent description, not an analysis of multiple sources.
+10. Do NOT mention field names, JSON, tags, labels, data sources, analysis tools, or data pipelines in the output. The following words/phrases are FORBIDDEN in your output: "ASR", "transcription", "speech recognition", "No Lyrics", "metadata", "Base Caption", "Base Music Caption", "preliminary description", "tagged with", "the metadata indicates", "despite the description", "contradicts". Never explain how the data was obtained or processed. Never compare, contrast, or discuss differences between data sources. Write as if you are a human listener describing what you hear — present a single coherent description, not an analysis of multiple sources.
 11. Keep the tone objective and descriptive, avoiding direct address to the listener.
 
 {LANGUAGE_RULE}
@@ -141,7 +139,49 @@ _INST_MIN_BUCKET = 5.0
 _INST_MAX_BUCKET = 30.0
 
 
+def _collect_neutuneset_instrument_spans(record: dict) -> str:
+    resolved = record.get("resolved_music_metadata")
+    if not isinstance(resolved, dict):
+        return ""
+    authority = resolved.get("authority")
+    if isinstance(authority, dict) and authority.get("instruments") != "neutuneset":
+        return ""
+
+    sections = resolved.get("sections") or []
+    if not isinstance(sections, list) or not sections:
+        return ""
+
+    spans: list[tuple[float, float, list[str]]] = []
+    for section in sections:
+        if not isinstance(section, dict):
+            continue
+        instruments = _normalize_inst_list(section.get("instruments") or [])
+        if not instruments:
+            continue
+        try:
+            start_t = float(section.get("start"))
+            end_t = float(section.get("end"))
+        except Exception:
+            continue
+        if end_t <= start_t:
+            continue
+        if spans and spans[-1][2] == instruments:
+            spans[-1] = (spans[-1][0], end_t, instruments)
+        else:
+            spans.append((start_t, end_t, instruments))
+
+    lines = [
+        f"[{_fmt_time(s)} - {_fmt_time(e)}] {', '.join(a)}"
+        for s, e, a in spans
+    ]
+    return "\n".join(lines)
+
+
 def _collect_instrument_spans(record: dict) -> str:
+    neutuneset_spans = _collect_neutuneset_instrument_spans(record)
+    if neutuneset_spans:
+        return neutuneset_spans
+
     changes = record.get("instruments_changes") or []
     if not isinstance(changes, list) or not changes:
         return ""
@@ -261,14 +301,20 @@ def build_segment_pack(record: dict) -> str:
 def collect_other_metadata(record: dict) -> dict:
     other_meta = {}
     for k in [
-        "duration_sec", "duration", "title", "artist", "genre_top",
-        "genres", "genres_all", "name", "artist_name", "music_tags",
+        "title", "artist", "genre_top", "genres", "genres_all",
+        "name", "artist_name", "music_tags",
         "mtg_genres", "mtg_instruments", "mtg_moodthemes", "mtg_top50",
     ]:
         if k in record:
             other_meta[k] = record[k]
     if "musicinfo" in record:
         other_meta["musicinfo"] = record["musicinfo"]
+    resolved = record.get("resolved_music_metadata")
+    if isinstance(resolved, dict):
+        for k in ["genres", "moods"]:
+            value = resolved.get(k)
+            if value:
+                other_meta[k] = value
     return other_meta
 
 
@@ -337,7 +383,7 @@ def _build_lyrics_section(track_json: dict) -> str:
 
 
 def build_prompt(track_json: dict, lang_mode: str, style_mode: str,
-                 harmony_mode: str) -> str:
+                 harmony_mode: str, hide_audio_path: bool = False) -> str:
     audio_path = extract_path(track_json)
     duration_sec = extract_duration_sec(track_json)
     base_caption = (
@@ -386,8 +432,12 @@ def build_prompt(track_json: dict, lang_mode: str, style_mode: str,
     style_rule = STYLE_RULE_SECTIONS if style_mode == "sections" else STYLE_RULE_PARAGRAPH
     harmony_rule = HARMONY_RULE_DEGREE if harmony_mode == "degree" else HARMONY_RULE_BASIC
 
+    audio_path_section = "" if hide_audio_path else (
+        f"audio_path:\n{audio_path or 'N/A'}\n\n"
+    )
+
     return PROMPT_TEMPLATE.format(
-        AUDIO_PATH=audio_path or "N/A",
+        AUDIO_PATH_SECTION=audio_path_section,
         DURATION_SEC=f"{duration_sec:.6f}" if duration_sec is not None else "N/A",
         BASE_MUSIC_CAPTION=base_caption or "N/A",
         SEGMENT_SECTION=segment_section,
@@ -469,12 +519,22 @@ def count_lines_fast(path: str) -> int:
     return n
 
 
-def reject_reasoning_output(text: str) -> str:
+def clean_llm_output(text: str, enable_thinking: bool) -> str:
     text = (text or "").strip()
     lowered = text.lower()
     leak_markers = ("<think>", "</think>", "here's a thinking process:")
+    if enable_thinking:
+        cleaned = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
+        lowered_cleaned = cleaned.lower()
+        if any(marker in lowered_cleaned for marker in leak_markers):
+            raise RuntimeError("LLM returned hidden reasoning in final output")
+        if not cleaned:
+            raise RuntimeError("LLM returned empty final output")
+        return cleaned
     if any(marker in lowered for marker in leak_markers):
         raise RuntimeError("LLM returned hidden reasoning despite enable_thinking=false")
+    if not text:
+        raise RuntimeError("LLM returned empty output")
     return text
 
 
@@ -483,6 +543,7 @@ def reject_reasoning_output(text: str) -> str:
 async def call_llm_async(
     session: aiohttp.ClientSession, api_url: str, api_key: str,
     model_name: str, prompt: str, temperature: float, max_tokens: int,
+    enable_thinking: bool,
 ) -> str:
     headers = {
         "Content-Type": "application/json",
@@ -498,7 +559,7 @@ async def call_llm_async(
         ],
         "temperature": float(temperature),
         "max_tokens": int(max_tokens),
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": bool(enable_thinking)},
     }
     async with session.post(api_url, headers=headers, json=payload) as resp:
         text = await resp.text()
@@ -506,7 +567,10 @@ async def call_llm_async(
             raise RuntimeError(f"HTTP {resp.status}: {text[:500]}")
         data = json.loads(text)
         try:
-            return reject_reasoning_output(data["choices"][0]["message"]["content"])
+            return clean_llm_output(
+                data["choices"][0]["message"]["content"],
+                enable_thinking=enable_thinking,
+            )
         except Exception as e:
             raise RuntimeError(f"Unexpected response: {text[:500]}") from e
 
@@ -519,7 +583,7 @@ async def worker(
     retries: int, rng: random.Random, lang_weights: dict,
     style_weights: dict, harmony_weights: dict, temperature: float,
     max_tokens: int, api_url: str, api_key: str, model_name: str,
-    file_to_output_path: dict,
+    file_to_output_path: dict, hide_audio_path: bool, enable_thinking: bool,
 ):
     while True:
         item = await queue.get()
@@ -541,7 +605,9 @@ async def worker(
             harmony_mode = "basic"
 
         prompt = build_prompt(record, lang_mode=lang_mode,
-                              style_mode=style_mode, harmony_mode=harmony_mode)
+                              style_mode=style_mode,
+                              harmony_mode=harmony_mode,
+                              hide_audio_path=hide_audio_path)
 
         caption = ""
         last_err = ""
@@ -551,10 +617,11 @@ async def worker(
                     caption = await call_llm_async(
                         session, api_url, api_key, model_name,
                         prompt, temperature=temperature, max_tokens=max_tokens,
+                        enable_thinking=enable_thinking,
                     )
                     break
                 except Exception as e:
-                    last_err = str(e)
+                    last_err = str(e) or type(e).__name__
                     if attempt < retries - 1:
                         await asyncio.sleep(2)
 
@@ -591,6 +658,7 @@ async def main_async(
     timeout_sec: int, seed: int, lang_weights: dict, style_weights: dict,
     harmony_weights: dict, temperature: float, max_tokens: int,
     api_url: str, api_key: str, model_name: str, pbar_global: tqdm,
+    hide_audio_path: bool, enable_thinking: bool,
 ):
     input_files = resolve_input_files(input_path)
     _, file_to_output_path, failed_log_path = \
@@ -603,7 +671,8 @@ async def main_async(
 
     print(f"[INFO] {len(input_files)} input file(s), {total_lines} lines, "
           f"already={already_processed}", file=sys.stderr)
-    print(f"[INFO] concurrency={concurrency} api_url={api_url}", file=sys.stderr)
+    print(f"[INFO] concurrency={concurrency} api_url={api_url} "
+          f"enable_thinking={int(enable_thinking)}", file=sys.stderr)
 
     timeout = ClientTimeout(total=timeout_sec)
     connector = aiohttp.TCPConnector(limit=concurrency * 2, ttl_dns_cache=300)
@@ -623,6 +692,7 @@ async def main_async(
                     pbar_global, retries, rngs[i], lang_weights, style_weights,
                     harmony_weights, temperature, max_tokens, api_url,
                     api_key, model_name, file_to_output_path,
+                    hide_audio_path, enable_thinking,
                 ))
                 for i in range(concurrency)
             ]
@@ -703,6 +773,10 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--temperature", type=float, default=0.6)
     p.add_argument("--max_tokens", type=int, default=16384)
+    p.add_argument("--hide_audio_path_in_prompt", action="store_true",
+                   help="Do not include the audio_path field in the LLM prompt; output records still keep audio_path.")
+    p.add_argument("--enable_thinking", action="store_true",
+                   help="Enable Qwen3.6 thinking mode for generation; hidden thinking blocks are removed from final outputs.")
     return p.parse_args()
 
 
@@ -741,6 +815,8 @@ def main():
                 harmony_weights=harmony_weights, temperature=args.temperature,
                 max_tokens=args.max_tokens, api_url=args.api_url,
                 api_key=api_key, model_name=args.model, pbar_global=pbar,
+                hide_audio_path=args.hide_audio_path_in_prompt,
+                enable_thinking=args.enable_thinking,
             )
         finally:
             pbar.close()

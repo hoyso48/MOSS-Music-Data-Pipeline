@@ -15,6 +15,7 @@ import asyncio
 import hashlib
 import random
 import argparse
+import re
 import aiohttp
 from aiohttp import ClientTimeout
 from tqdm import tqdm
@@ -261,12 +262,22 @@ def make_seed(stable_key: str) -> str:
     return h[:8]
 
 
-def reject_reasoning_output(text: str) -> str:
+def clean_llm_output(text: str, enable_thinking: bool) -> str:
     text = (text or "").strip()
     lowered = text.lower()
     leak_markers = ("<think>", "</think>", "here's a thinking process:")
+    if enable_thinking:
+        cleaned = re.sub(r"(?is)<think>.*?</think>", "", text).strip()
+        lowered_cleaned = cleaned.lower()
+        if any(marker in lowered_cleaned for marker in leak_markers):
+            raise RuntimeError("LLM returned hidden reasoning in final output")
+        if not cleaned:
+            raise RuntimeError("LLM returned empty final output")
+        return cleaned
     if any(marker in lowered for marker in leak_markers):
         raise RuntimeError("LLM returned hidden reasoning despite enable_thinking=false")
+    if not text:
+        raise RuntimeError("LLM returned empty output")
     return text
 
 
@@ -349,7 +360,8 @@ def read_processed_counts(output_mode: str, file_to_output_path: dict,
 
 async def call_llm(session: aiohttp.ClientSession, api_url: str,
                    api_key: str, model_name: str, user_prompt: str,
-                   temperature: float = 0.8) -> str:
+                   temperature: float = 0.8,
+                   enable_thinking: bool = False) -> str:
     headers = {
         "Content-Type": "application/json",
         "Authorization": f"Bearer {api_key}",
@@ -364,14 +376,17 @@ async def call_llm(session: aiohttp.ClientSession, api_url: str,
         ],
         "temperature": temperature,
         "max_tokens": 4096,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": bool(enable_thinking)},
     }
     async with session.post(api_url, headers=headers, json=payload) as resp:
         text = await resp.text()
         if resp.status >= 400:
             raise RuntimeError(f"HTTP {resp.status}: {text[:500]}")
         data = json.loads(text)
-        return reject_reasoning_output(data["choices"][0]["message"]["content"])
+        return clean_llm_output(
+            data["choices"][0]["message"]["content"],
+            enable_thinking=enable_thinking,
+        )
 
 
 def parse_prompt_json(s: str) -> str:
@@ -404,7 +419,7 @@ async def worker(
     name: str, session: aiohttp.ClientSession, queue: asyncio.Queue,
     sem: asyncio.Semaphore, out_handles: dict, failed_fh, pbar: tqdm,
     retries: int, api_url: str, api_key: str, model_name: str,
-    file_to_output_path: dict,
+    file_to_output_path: dict, enable_thinking: bool,
 ):
     while True:
         item = await queue.get()
@@ -438,26 +453,24 @@ async def worker(
 
             llm_out = ""
             last_err = ""
+            user_query = ""
             async with sem:
                 for attempt in range(retries):
                     try:
                         llm_out = await call_llm(
                             session, api_url, api_key, model_name,
                             gen_prompt, temperature=0.9,
+                            enable_thinking=enable_thinking,
                         )
+                        user_query = parse_prompt_json(llm_out)
                         break
                     except Exception as e:
-                        last_err = str(e)
+                        last_err = str(e) or type(e).__name__
+                        if llm_out:
+                            last_err = (f"query generation/parse failed: "
+                                        f"{last_err} | raw={llm_out[:300]!r}")
                         if attempt < retries - 1:
                             await asyncio.sleep(1.5)
-
-            user_query = ""
-            if llm_out:
-                try:
-                    user_query = parse_prompt_json(llm_out)
-                except Exception as e:
-                    last_err = (f"parse prompt json failed: {e} | "
-                                f"raw={llm_out[:300]!r}")
 
             if not user_query:
                 rng = random.Random(int(seed, 16))
@@ -514,6 +527,7 @@ async def worker(
 async def main_async(
     input_path: str, output_path: str, api_url: str, api_key: str,
     model_name: str, concurrency: int, retries: int, timeout_sec: int,
+    enable_thinking: bool,
 ):
     input_files = resolve_input_files(input_path)
     if not input_files:
@@ -538,7 +552,8 @@ async def main_async(
     total_lines = sum(count_lines_fast(fp) for _, fp in input_files)
 
     print(f"[INFO] {len(input_files)} file(s), {total_lines} lines, "
-          f"already={already}", file=sys.stderr)
+          f"already={already} enable_thinking={int(enable_thinking)}",
+          file=sys.stderr)
 
     timeout = ClientTimeout(total=timeout_sec)
     connector = aiohttp.TCPConnector(limit=concurrency * 2, ttl_dns_cache=300)
@@ -563,7 +578,7 @@ async def main_async(
                 asyncio.create_task(worker(
                     f"w{i}", session, queue, sem, out_handles, failed_fh,
                     pbar, retries, api_url, api_key, model_name,
-                    file_to_output_path,
+                    file_to_output_path, enable_thinking,
                 ))
                 for i in range(concurrency)
             ]
@@ -618,6 +633,8 @@ def parse_args():
     p.add_argument("--concurrency", type=int, default=256)
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--timeout_sec", type=int, default=180)
+    p.add_argument("--enable_thinking", action="store_true",
+                   help="Enable Qwen3.6 thinking mode for query generation; hidden thinking blocks are removed from final outputs.")
     return p.parse_args()
 
 
@@ -633,6 +650,7 @@ def main():
         api_url=args.api_url, api_key=api_key, model_name=args.model,
         concurrency=args.concurrency, retries=args.retries,
         timeout_sec=args.timeout_sec,
+        enable_thinking=args.enable_thinking,
     ))
 
 

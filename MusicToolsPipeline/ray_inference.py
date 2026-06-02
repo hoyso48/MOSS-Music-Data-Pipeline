@@ -515,8 +515,13 @@ if __name__ == '__main__':
     workers = []
     print("num_workers:", num_workers)
     model_path = getattr(cfg, "model_path", None) or None  # 允许某些模型不需要 model_path
+    worker_kwargs = {}
+    if getattr(cfg, "model_worker_num_gpus", 0.0) > 0:
+        worker_kwargs["num_gpus"] = cfg.model_worker_num_gpus
+    if getattr(cfg, "model_worker_num_cpus", 0.0) > 0:
+        worker_kwargs["num_cpus"] = cfg.model_worker_num_cpus
     for i in range(num_workers):
-        workers.append(create_worker(model_type=cfg.model_type, model_path=model_path))
+        workers.append(create_worker(model_type=cfg.model_type, model_path=model_path, **worker_kwargs))
     # 等待所有 worker 完成初始化
     try:
         ray.get([w.get_model_info.remote() for w in workers])

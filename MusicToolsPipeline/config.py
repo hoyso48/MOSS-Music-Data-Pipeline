@@ -57,6 +57,8 @@ class Config:
         self.infer_group_size: int = 80
         self.num_dataloader_workers: int = 1  # DataLoaderWorker 数量，用于并行加载数据
         self.num_workers: int = 0
+        self.model_worker_num_gpus: float = 0.0
+        self.model_worker_num_cpus: float = 0.0
     
     def get_dataloader_kwargs(self) -> dict:
         """获取数据加载器所需的 kwargs"""
